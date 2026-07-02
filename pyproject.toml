@@ -1,0 +1,13 @@
+[project]
+name = "job-sl"
+version = "0.1.0"
+description = "job_sources 共通土台(schema/L1書込/L2マージ)"
+requires-python = ">=3.9"
+dependencies = ["boto3"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["job_sl*"]
