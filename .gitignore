@@ -4,3 +4,4 @@ __pycache__/
 dist/
 build/
 .env
+job_master_dryrun.csv
