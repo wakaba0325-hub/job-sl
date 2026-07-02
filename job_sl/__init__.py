@@ -28,11 +28,21 @@ COMMON_SCHEMA = [
     "source",
     "company_name",
     "job_title",
+    "occupational_category",
     "employment_type",
     "salary_min",
     "salary_max",
     "salary_currency",
     "location",
+    "work_hours",
+    "required_skills",
+    "benefits",
+    "appeal_points",
+    "remote_work",
+    "company_industry",
+    "company_size",
+    "company_capital",
+    "direct_apply",
     "posted_date",
     "valid_through",
     "job_url",
@@ -62,21 +72,13 @@ def key_for(row: dict):
 
 
 def to_common(source: str, r: dict) -> dict:
-    return {
-        "source": source,
-        "company_name": (r.get("company_name") or "").strip(),
-        "job_title": (r.get("job_title") or "").strip(),
-        "employment_type": (r.get("employment_type") or "").strip(),
-        "salary_min": (r.get("salary_min") or "").strip(),
-        "salary_max": (r.get("salary_max") or "").strip(),
-        "salary_currency": (r.get("salary_currency") or "").strip(),
-        "location": (r.get("location") or "").strip(),
-        "posted_date": (r.get("posted_date") or "").strip(),
-        "valid_through": (r.get("valid_through") or "").strip(),
-        "job_url": (r.get("job_url") or "").strip(),
-        "description_snippet": (r.get("description_snippet") or "").strip()[:300],
-        "scraped_at": (r.get("scraped_at") or "").strip(),
-    }
+    out = {"source": source}
+    for col in COMMON_SCHEMA:
+        if col == "source":
+            continue
+        out[col] = (r.get(col) or "").strip()
+    out["description_snippet"] = out["description_snippet"][:300]
+    return out
 
 
 # ---- L1 読み書き -----------------------------------------------------------
