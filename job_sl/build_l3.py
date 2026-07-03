@@ -27,7 +27,10 @@ from . import l3
 
 csv.field_size_limit(10**7)
 
-SOURCES = ["green", "rikunabi", "wantedly", "bizreach"]
+SOURCES = ["green", "rikunabi", "wantedly", "bizreach", "type"]
+# mynaviは並列書込の競合回避のためシャード別ソース名(mynavi0..6)で書かれている。
+# ここで統合し、job_masterの表示上は source="mynavi" にまとめる。
+SHARDED_SOURCES = {"mynavi": [f"mynavi{i}" for i in range(7)]}
 L2_PREFIX = "master/job_sources/"
 CM_PREFIX = "master/company_master/"
 CM_FILE = "company_master.csv"
@@ -76,6 +79,19 @@ def build(apply: bool):
             r["source"] = src
         all_rows.extend(rows)
         print(f"  L2 {src}: {key}  {len(rows):,}行")
+
+    for display_src, shard_srcs in SHARDED_SOURCES.items():
+        n_total = 0
+        for shard_src in shard_srcs:
+            key = latest_key(f"{L2_PREFIX}{shard_src}/", f"{shard_src}.csv")
+            if not key:
+                continue
+            rows = _read_csv_s3(key)
+            for r in rows:
+                r["source"] = display_src
+            all_rows.extend(rows)
+            n_total += len(rows)
+        print(f"  L2 {display_src}(shard統合): {n_total:,}行")
 
     print(f"\n全ソース合計: {len(all_rows):,}行")
 
