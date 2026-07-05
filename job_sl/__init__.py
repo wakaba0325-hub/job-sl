@@ -167,6 +167,20 @@ def build_l2(source: str, run_date: str | None = None, write: bool = True):
 # ---- 最新パーティション解決 -------------------------------------------------
 
 
+def existing_urls(source: str) -> set[str]:
+    """最新L2のjob_url集合(=既知の求人)。無ければ空集合。
+    詳細ページの再取得要否をコレクタ側で判定するための軽量ヘルパー
+    (L1全履歴は読まず、既にdedup済みの最新L2 1ファイルだけを読む)。"""
+    key = latest_key(f"master/job_sources/{source}/", f"{source}.csv")
+    if not key:
+        return set()
+    try:
+        rows = _read_csv_s3(key)
+    except Exception:
+        return set()
+    return {r.get("job_url", "").strip() for r in rows if r.get("job_url")}
+
+
 def latest_key(prefix: str, fname: str) -> str | None:
     """`{prefix}{YYYYMMDD}/{fname}` を list_objects_v2 + 正規表現で最新解決。"""
     s3 = _s3()
