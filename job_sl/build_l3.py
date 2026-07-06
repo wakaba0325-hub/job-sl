@@ -27,7 +27,7 @@ from . import l3
 
 csv.field_size_limit(10**7)
 
-SOURCES = ["green", "rikunabi", "wantedly", "bizreach", "type"]
+SOURCES = ["green", "rikunabi", "wantedly", "bizreach", "type", "youtrust"]
 # mynaviは並列書込の競合回避のためシャード別ソース名(mynavi0..6)で書かれている。
 # ここで統合し、job_masterの表示上は source="mynavi" にまとめる。
 SHARDED_SOURCES = {"mynavi": [f"mynavi{i}" for i in range(7)]}
