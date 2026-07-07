@@ -102,17 +102,22 @@ def build(apply: bool):
 
     out = []
     match_stats = Counter()
+    method_stats = Counter()
     for r in all_rows:
-        houjin, ambiguous = l3.match_houjin(r.get("company_name", ""), cm_index)
+        houjin, ambiguous, method = l3.match_houjin(
+            r.get("company_name", ""), cm_index, location=r.get("location", "")
+        )
         match_stats[
             "matched" if houjin else ("ambiguous" if ambiguous else "unmatched")
         ] += 1
+        method_stats[method] += 1
         job_url = r.get("job_url", "")
         first_seen = prev_first_seen.get(job_url) or today_iso
         is_new = "1" if job_url not in prev_first_seen else "0"
         row = {k: r.get(k, "") for k in l3.JOB_MASTER_SCHEMA}
         row["houjin_bangou"] = houjin
         row["is_ambiguous_company"] = "1" if ambiguous else ""
+        row["match_method"] = method
         row["first_seen_date"] = first_seen
         row["is_new_today"] = is_new
         out.append(row)
@@ -121,6 +126,7 @@ def build(apply: bool):
     print(
         f"  マッチ: {match_stats['matched']:,} / 同名複数: {match_stats['ambiguous']:,} / 未マッチ: {match_stats['unmatched']:,}"
     )
+    print(f"  内訳: {dict(method_stats)}")
     n_new = sum(1 for r in out if r["is_new_today"] == "1")
     print(f"\n=== 新規掲載検知 ===")
     print(f"  本日新規(is_new_today=1): {n_new:,} / 既存: {len(out) - n_new:,}")
