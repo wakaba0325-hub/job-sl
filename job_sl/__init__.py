@@ -127,6 +127,67 @@ def write_l1(source: str, rows: list[dict], run_date: str | None = None):
     return key, len(new)
 
 
+class L1Checkpointer:
+    """1プロセス内で複数回に分けてL1へ追記するコレクタ用(長時間巡回の中間保存)。
+
+    `write_l1`は呼ぶたびに`read_all_l1`でそのソースの全履歴パーティションを
+    S3から再ダウンロード・再パースする(job_urlの重複排除のためだけに、生の
+    description等を含む全カラムを読む設計)。マイナビのように5000件ごとに
+    チェックポイントすると、これが1日20回(write_l1+build_l2×10回)発生し、
+    蓄積した履歴が多いほど際限なく重くなる。
+
+    このクラスは全履歴スキャンを初回(`__init__`)の1回だけ行い、以降は
+    プロセス内メモリでdedupを完結させる。当日パーティションへの書込自体は
+    `flush`のたびに行う(そこは中断時のデータ保全のため必要)。`build_l2`は
+    呼ばないので、呼び出し元がrun完了時(および可能なら中断時)に1回だけ
+    別途呼ぶこと。
+    """
+
+    def __init__(self, source: str, run_date: str | None = None):
+        self.source = source
+        self.run_date = run_date or _today()
+        self._key = f"raw/job_sources/{source}/{self.run_date}/{source}.csv"
+        self._seen = {key_for(to_common(source, r)) for r in read_all_l1(source)}
+        try:
+            self._existing = _read_csv_s3(self._key)
+        except Exception:
+            self._existing = []
+        self._new_rows: list[dict] = []
+
+    def flush(self, rows: list[dict]) -> int:
+        """rowsのうち未知のjob_urlだけを当日L1パーティションへ追記して保存する。
+        新規追記件数を返す。"""
+        new = [
+            r
+            for r in rows
+            if key_for(to_common(self.source, r)) not in self._seen and key_for(r)
+        ]
+        for r in new:
+            self._seen.add(key_for(to_common(self.source, r)))
+        self._new_rows.extend(new)
+
+        all_rows = self._existing + self._new_rows
+        cols = (
+            list(all_rows[0].keys())
+            if all_rows
+            else list(rows[0].keys())
+            if rows
+            else []
+        )
+        for r in rows:
+            for k in r:
+                if k not in cols:
+                    cols.append(k)
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(all_rows)
+        _s3().put_object(
+            Bucket=BUCKET, Key=self._key, Body=buf.getvalue().encode("utf-8-sig")
+        )
+        return len(new)
+
+
 # ---- L2 ビルド -------------------------------------------------------------
 
 
