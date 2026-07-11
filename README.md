@@ -19,6 +19,18 @@ _, n_new = jsl.write_l1("green", rows)
 _, l2_key = jsl.build_l2("green")
 ```
 
+`write_l1`/`build_l2`は呼ぶたびにそのソースの全L1履歴をS3から再ダウンロード・再パースする
+(job_urlの重複排除のためだけに全カラムを読む設計)。1回のプロセス内で何度もチェックポイント
+保存する長時間巡回コレクタ(マイナビ等)では`L1Checkpointer`を使い、全履歴スキャンを
+プロセス開始時の1回だけにすること:
+
+```python
+cp = jsl.L1Checkpointer("mynavi0")
+for batch in ...:
+    n_new = cp.flush(batch)  # 当日L1パーティションへ都度保存、履歴re-scanなし
+jsl.build_l2("mynavi0")  # build_l2はコストが高いのでrun完了時に1回だけ呼ぶ
+```
+
 ## L3: job_master (全ソース統合・company_master突合・新規掲載検知)
 
 `python -m job_sl.build_l3 [--apply]` (実行は別リポ `job-master-consolidate` から)で:
