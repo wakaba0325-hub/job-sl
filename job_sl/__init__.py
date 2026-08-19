@@ -242,6 +242,31 @@ def existing_urls(source: str) -> set[str]:
     return {r.get("job_url", "").strip() for r in rows if r.get("job_url")}
 
 
+# ---- 掲載終了検知(seen_urls) -----------------------------------------------
+
+
+def write_seen_urls(
+    source: str,
+    urls: list[str],
+    run_date: str | None = None,
+    shard: int | None = None,
+):
+    """当日のフル巡回で実際に確認できた全job_url一覧を保存する(掲載終了検知用)。
+    新規/既知を問わず、その日にサイト側に存在が確認できたURL全件が対象。
+    shard指定時(シャード実行対応コレクタ用)はファイル名に `_shard{N}` を付与し、
+    シャードごとに別ファイルへ書く(後段のL3側で同日分の全シャードを結合する)。"""
+    rd = run_date or _today()
+    suffix = f"_shard{shard}" if shard is not None else ""
+    key = f"raw/job_sources/{source}/{rd}/{source}_seen_urls{suffix}.csv"
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["job_url"])
+    for u in urls:
+        w.writerow([u])
+    _s3().put_object(Bucket=BUCKET, Key=key, Body=buf.getvalue().encode("utf-8-sig"))
+    return key, len(urls)
+
+
 def latest_key(prefix: str, fname: str) -> str | None:
     """`{prefix}{YYYYMMDD}/{fname}` を list_objects_v2 + 正規表現で最新解決。"""
     s3 = _s3()

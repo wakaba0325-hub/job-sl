@@ -204,7 +204,31 @@ JOB_MASTER_SCHEMA = [
     "scraped_at",
     "first_seen_date",
     "is_new_today",
+    "listing_status",
+    "closed_detected_date",
 ]
+
+# 掲載終了検知対象ソース: サイト全体を毎日フル巡回しており、当日確認できた全URL一覧
+# (`{source}_seen_urls.csv`、jobmedley/mynaviはshard分割時 `{source}_seen_urls_shard{N}.csv`)を
+# write_seen_urls で書き出している媒体のみ。mynaviは7シャード(mynavi0..6)をL3側で
+# source="mynavi"として統合する既存パターンに合わせ、seen_urls側もshard0..6を
+# source="mynavi"名義で書いて束ねる。
+# 未対応(rikunabi/bizreach)は日次フル巡回コストの都合で今回のスコープ外のため、
+# listing_statusは常に"unknown"とする(把握できないものをactiveと誤断定しない)。
+CLOSURE_DETECTION_SOURCES = [
+    "green",
+    "paiza",
+    "ambi",
+    "jobmedley",
+    "type",
+    "youtrust",
+    "mynavi",
+    "wantedly",
+]
+
+# 安全装置の閾値: 当日確認できたURL件数が前日job_master内の同ソース件数の
+# この比率を下回ったら、クロール不完全の疑いありとして当日の掲載終了判定を全件スキップする。
+SAFETY_THRESHOLD_RATIO = 0.7
 
 
 def index_company_master(
