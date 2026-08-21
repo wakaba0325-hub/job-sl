@@ -213,7 +213,10 @@ JOB_MASTER_SCHEMA = [
 # write_seen_urls で書き出している媒体のみ。mynaviは7シャード(mynavi0..6)をL3側で
 # source="mynavi"として統合する既存パターンに合わせ、seen_urls側もshard0..6を
 # source="mynavi"名義で書いて束ねる。
-# 未対応(rikunabi/bizreach)は日次フル巡回コストの都合で今回のスコープ外のため、
+# rikunabiは検索結果ページングにrobots.txt Disallow対象の`?cursor=`を使う
+# (rikunabi-job-collector側でユーザーが経緯を把握の上で無視する方針を明示決定済み。
+# 詳細は rikunabi-job-collector リポジトリの README 参照)。
+# 未対応(bizreach)は日次フル巡回コストの都合で今回のスコープ外のため、
 # listing_statusは常に"unknown"とする(把握できないものをactiveと誤断定しない)。
 CLOSURE_DETECTION_SOURCES = [
     "green",
@@ -224,6 +227,7 @@ CLOSURE_DETECTION_SOURCES = [
     "youtrust",
     "mynavi",
     "wantedly",
+    "rikunabi",
 ]
 
 # 安全装置の閾値: 当日確認できたURL件数が前日job_master内の同ソース件数の
