@@ -48,6 +48,8 @@ SOURCES = [
     "ambi",
     "paiza",
     "jobmedley",
+    "levtech_career",
+    "levtech_freelance",
 ]
 # mynaviは並列書込の競合回避のためシャード別ソース名(mynavi0..6)で書かれている。
 # ここで統合し、job_masterの表示上は source="mynavi" にまとめる。

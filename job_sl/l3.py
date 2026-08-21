@@ -228,6 +228,8 @@ CLOSURE_DETECTION_SOURCES = [
     "mynavi",
     "wantedly",
     "rikunabi",
+    "levtech_career",
+    "levtech_freelance",
 ]
 
 # 安全装置の閾値: 当日確認できたURL件数が前日job_master内の同ソース件数の
