@@ -50,10 +50,26 @@ SOURCES = [
     "jobmedley",
     "levtech_career",
     "levtech_freelance",
+    "en_tenshoku",
+    "townwork",
+    "ms_japan",
+    "careerconnection",
+    "findy",
+    "hupro",
+    "crowdworks",
+    "itpropartners",
+    "stanby",
 ]
 # mynaviは並列書込の競合回避のためシャード別ソース名(mynavi0..6)で書かれている。
 # ここで統合し、job_masterの表示上は source="mynavi" にまとめる。
-SHARDED_SOURCES = {"mynavi": [f"mynavi{i}" for i in range(7)]}
+# 同様の理由で mynavi_shinsotsu/geekly/jac_recruitment/kaigojob もシャード分割している。
+SHARDED_SOURCES = {
+    "mynavi": [f"mynavi{i}" for i in range(7)],
+    "mynavi_shinsotsu": [f"mynavi_shinsotsu{i}" for i in range(4)],
+    "geekly": [f"geekly{i}" for i in range(3)],
+    "jac_recruitment": [f"jac_recruitment{i}" for i in range(4)],
+    "kaigojob": [f"kaigojob{i}" for i in range(6)],
+}
 L2_PREFIX = "master/job_sources/"
 CM_PREFIX = "master/company_master/"
 CM_FILE = "company_master.csv"

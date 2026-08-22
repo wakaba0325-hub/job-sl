@@ -230,7 +230,20 @@ CLOSURE_DETECTION_SOURCES = [
     "rikunabi",
     "levtech_career",
     "levtech_freelance",
+    "en_tenshoku",
+    "mynavi_shinsotsu",
+    "geekly",
+    "jac_recruitment",
+    "townwork",
+    "kaigojob",
+    "careerconnection",
+    "findy",
+    "hupro",
+    "crowdworks",
+    "itpropartners",
 ]
+# 未登録(意図的): ms_japan(検索結果件数が不安定と判明・原因特定まで保留)、
+# stanby(都道府県トップページ上位分のみのサンプリング収集のため「今日見えない=掲載終了」の前提が成立しない)。
 
 # 安全装置の閾値: 当日確認できたURL件数が前日job_master内の同ソース件数の
 # この比率を下回ったら、クロール不完全の疑いありとして当日の掲載終了判定を全件スキップする。
