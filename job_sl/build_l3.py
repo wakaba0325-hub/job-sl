@@ -59,16 +59,28 @@ SOURCES = [
     "crowdworks",
     "itpropartners",
     "stanby",
+    "mynavi_comedical",
+    "mynavi_zeirishi",
+    "mynavi_kaikeishi",
 ]
 # mynaviは並列書込の競合回避のためシャード別ソース名(mynavi0..6)で書かれている。
 # ここで統合し、job_masterの表示上は source="mynavi" にまとめる。
-# 同様の理由で mynavi_shinsotsu/geekly/jac_recruitment/kaigojob もシャード分割している。
+# 同様の理由で mynavi_shinsotsu/geekly/jac_recruitment/kaigojob/mynavi_kango/
+# mynavi_pharma/mynavi_kaigo/mynavi_baito/mynavi_hoiku/levwell_kango/levwell_kaigo
+# もシャード分割している。
 SHARDED_SOURCES = {
     "mynavi": [f"mynavi{i}" for i in range(7)],
     "mynavi_shinsotsu": [f"mynavi_shinsotsu{i}" for i in range(4)],
     "geekly": [f"geekly{i}" for i in range(3)],
     "jac_recruitment": [f"jac_recruitment{i}" for i in range(4)],
     "kaigojob": [f"kaigojob{i}" for i in range(6)],
+    "mynavi_kango": [f"mynavi_kango{i}" for i in range(6)],
+    "mynavi_pharma": [f"mynavi_pharma{i}" for i in range(2)],
+    "mynavi_kaigo": [f"mynavi_kaigo{i}" for i in range(4)],
+    "mynavi_baito": [f"mynavi_baito{i}" for i in range(10)],
+    "mynavi_hoiku": [f"mynavi_hoiku{i}" for i in range(6)],
+    "levwell_kango": [f"levwell_kango{i}" for i in range(6)],
+    "levwell_kaigo": [f"levwell_kaigo{i}" for i in range(5)],
 }
 L2_PREFIX = "master/job_sources/"
 CM_PREFIX = "master/company_master/"

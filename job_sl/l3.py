@@ -241,9 +241,20 @@ CLOSURE_DETECTION_SOURCES = [
     "hupro",
     "crowdworks",
     "itpropartners",
+    "mynavi_kango",
+    "mynavi_pharma",
+    "mynavi_comedical",
+    "mynavi_kaigo",
+    "mynavi_hoiku",
+    "mynavi_zeirishi",
+    "mynavi_kaikeishi",
+    "levwell_kango",
+    "levwell_kaigo",
 ]
 # 未登録(意図的): ms_japan(検索結果件数が不安定と判明・原因特定まで保留)、
-# stanby(都道府県トップページ上位分のみのサンプリング収集のため「今日見えない=掲載終了」の前提が成立しない)。
+# stanby(都道府県トップページ上位分のみのサンプリング収集のため「今日見えない=掲載終了」の前提が成立しない)、
+# mynavi_baito(「ドア」ページ1件あたり先頭30件までしか拾えない構造上の網羅性制約があり、
+# 「今日見えない=掲載終了」の前提が成立しない)。
 
 # 安全装置の閾値: 当日確認できたURL件数が前日job_master内の同ソース件数の
 # この比率を下回ったら、クロール不完全の疑いありとして当日の掲載終了判定を全件スキップする。
