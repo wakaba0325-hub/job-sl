@@ -105,16 +105,28 @@ def _load_company_master():
 
 def _load_existing_job_master():
     """既存job_masterから job_url→{first_seen_date, listing_status, closed_detected_date}
-    のメタ情報と、ソース別の行数(安全装置の前日ベースライン)を返す。"""
+    のメタ情報と、ソース別の行数(安全装置の前日ベースライン)を返す。
+
+    メモリ効率のため `_read_csv_s3`(list(DictReader(...))で全カラムを一括list化する)は
+    使わず、DictReaderを1行ずつ遅延評価する。既存job_masterは全30カラムだが実際に使うのは
+    job_url込み4カラムのみのため、全カラムのdictを数百万行分list保持すると
+    (all_rows/cm_indexが既にメモリを占有した状態で)ピーク時にOOMの原因になっていた。
+    1行ずつ処理し使う分だけprev_metaに残すことで、同等の結果をより少ないメモリで得る。"""
     key = latest_key(JM_PREFIX, JM_FILE)
     if not key:
         print("  既存job_master: なし(初回ビルド)")
         return {}, Counter()
-    rows = _read_csv_s3(key)
-    print(f"  既存job_master: {key}  ({len(rows):,}行)")
+    body = (
+        _s3()
+        .get_object(Bucket=BUCKET, Key=key)["Body"]
+        .read()
+        .decode("utf-8-sig", errors="replace")
+    )
     prev_meta = {}
     prev_source_counts = Counter()
-    for r in rows:
+    n = 0
+    for r in csv.DictReader(io.StringIO(body)):
+        n += 1
         job_url = r.get("job_url")
         if not job_url:
             continue
@@ -124,6 +136,7 @@ def _load_existing_job_master():
             "closed_detected_date": r.get("closed_detected_date", ""),
         }
         prev_source_counts[r.get("source", "")] += 1
+    print(f"  既存job_master: {key}  ({n:,}行)")
     return prev_meta, prev_source_counts
 
 
@@ -219,11 +232,24 @@ def build(apply: bool):
                 f"listing_status=unknownとします。"
             )
 
-    out = []
+    # メモリ効率のため、all_rows(全ソース分の入力行)とout(出力行)を同時に全件保持しない。
+    # all_rowsをreverse()して末尾からpop()することで、消費した入力行から順次解放しつつ
+    # (元の順序はreverse+pop-from-endで維持される)、出力もリストに溜めずCSVバッファへ
+    # 都度書き出す。件数が急増(マイナビ系8媒体・レバウェル系2媒体追加等)した際に
+    # all_rows+out二重保持がOOMの一因になっていたための対策。
+    n_total = len(all_rows)
+    all_rows.reverse()
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=l3.JOB_MASTER_SCHEMA, extrasaction="ignore")
+    w.writeheader()
+
     match_stats = Counter()
     method_stats = Counter()
     listing_status_stats: Counter = Counter()
-    for r in all_rows:
+    n_new = 0
+    while all_rows:
+        r = all_rows.pop()
         houjin, ambiguous, method = l3.match_houjin(
             r.get("company_name", ""), cm_index, location=r.get("location", "")
         )
@@ -235,6 +261,8 @@ def build(apply: bool):
         prev = prev_meta.get(job_url, {})
         first_seen = prev.get("first_seen_date") or today_iso
         is_new = "1" if job_url not in prev_meta else "0"
+        if is_new == "1":
+            n_new += 1
 
         src = r.get("source", "")
         if src in l3.CLOSURE_DETECTION_SOURCES and safety_ok_by_source.get(src):
@@ -261,16 +289,15 @@ def build(apply: bool):
         row["is_new_today"] = is_new
         row["listing_status"] = listing_status
         row["closed_detected_date"] = closed_detected_date
-        out.append(row)
+        w.writerow(row)
 
     print(f"\n=== company_master突合 ===")
     print(
         f"  マッチ: {match_stats['matched']:,} / 同名複数: {match_stats['ambiguous']:,} / 未マッチ: {match_stats['unmatched']:,}"
     )
     print(f"  内訳: {dict(method_stats)}")
-    n_new = sum(1 for r in out if r["is_new_today"] == "1")
     print(f"\n=== 新規掲載検知 ===")
-    print(f"  本日新規(is_new_today=1): {n_new:,} / 既存: {len(out) - n_new:,}")
+    print(f"  本日新規(is_new_today=1): {n_new:,} / 既存: {n_total - n_new:,}")
 
     print(f"\n=== 掲載終了検知 結果(source別 listing_status) ===")
     by_source: dict[str, dict[str, int]] = {}
@@ -279,11 +306,6 @@ def build(apply: bool):
     for src in sorted(by_source):
         parts = ", ".join(f"{k}={v:,}" for k, v in sorted(by_source[src].items()))
         print(f"  {src}: {parts}")
-
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=l3.JOB_MASTER_SCHEMA, extrasaction="ignore")
-    w.writeheader()
-    w.writerows(out)
     data = buf.getvalue().encode("utf-8-sig")
 
     if not apply:
@@ -293,7 +315,10 @@ def build(apply: bool):
         return
 
     out_key = f"{JM_PREFIX}{today}/{JM_FILE}"
-    _s3().put_object(Bucket=BUCKET, Key=out_key, Body=data)
+    # put_object はS3の単発PUT上限(5GB)を超えるとEntityTooLargeで失敗する。
+    # 件数増加でjob_master.csvが5GBを超えるようになったため、upload_fileobj
+    # (boto3のTransferManagerが必要に応じ自動でマルチパートアップロードする)に変更。
+    _s3().upload_fileobj(io.BytesIO(data), BUCKET, out_key)
     print(f"\n[apply] 書込完了: s3://{BUCKET}/{out_key}")
 
 
