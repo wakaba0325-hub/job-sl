@@ -40,7 +40,6 @@ csv.field_size_limit(10**7)
 
 SOURCES = [
     "green",
-    "rikunabi",
     "wantedly",
     "bizreach",
     "type",
@@ -68,8 +67,14 @@ SOURCES = [
 # 同様の理由で mynavi_shinsotsu/geekly/jac_recruitment/kaigojob/mynavi_kango/
 # mynavi_pharma/mynavi_kaigo/mynavi_baito/mynavi_hoiku/levwell_kango/levwell_kaigo
 # もシャード分割している。
+# 2026-08-27追加: rikunabiは47都道府県・求人詳細ページ計12万件規模を単一プロセスの
+# 日次ウィンドウ内で完走できないと判明したため、都道府県を実測求人数で均等分割した
+# 12シャード(rikunabi0..rikunabi11)に変更(rikunabi-job-collector側で再設計・
+# 詳細はそのREADME参照)。表示名"rikunabi"はCLOSURE_DETECTION_SOURCES側で従来どおり
+# 使う(seen_urlsのshard集約ロジックは_load_seen_urls側が対応済み)。
 SHARDED_SOURCES = {
     "mynavi": [f"mynavi{i}" for i in range(7)],
+    "rikunabi": [f"rikunabi{i}" for i in range(12)],
     "mynavi_shinsotsu": [f"mynavi_shinsotsu{i}" for i in range(4)],
     "geekly": [f"geekly{i}" for i in range(3)],
     "jac_recruitment": [f"jac_recruitment{i}" for i in range(4)],
