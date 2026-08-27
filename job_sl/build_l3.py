@@ -78,7 +78,9 @@ SHARDED_SOURCES = {
     "mynavi_pharma": [f"mynavi_pharma{i}" for i in range(2)],
     "mynavi_kaigo": [f"mynavi_kaigo{i}" for i in range(4)],
     "mynavi_baito": [f"mynavi_baito{i}" for i in range(10)],
-    "mynavi_hoiku": [f"mynavi_hoiku{i}" for i in range(6)],
+    # 2026-08-27改訂: SHARD_COUNT 6→36(日次ウィンドウ内に完走しないため。
+    # mynavi-hoiku-job-collector側で再設計・詳細はそのREADME参照)。
+    "mynavi_hoiku": [f"mynavi_hoiku{i}" for i in range(36)],
     "levwell_kango": [f"levwell_kango{i}" for i in range(6)],
     "levwell_kaigo": [f"levwell_kaigo{i}" for i in range(5)],
 }
