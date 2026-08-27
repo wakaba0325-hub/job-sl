@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 import boto3
 from botocore.config import Config as _BotoConfig
 
+from job_sl.exclusive_run import ensure_exclusive as ensure_exclusive
+
 REGION = "ap-northeast-1"
 BUCKET = "emooove-data-lake"
 JST = timezone(timedelta(hours=9))
