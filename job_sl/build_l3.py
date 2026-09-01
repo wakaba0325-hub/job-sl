@@ -30,7 +30,9 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import os
 import re
+import tempfile
 from collections import Counter
 
 from . import BUCKET, _read_csv_s3, _s3, _today, latest_key
@@ -247,8 +249,19 @@ def build(apply: bool):
     n_total = len(all_rows)
     all_rows.reverse()
 
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=l3.JOB_MASTER_SCHEMA, extrasaction="ignore")
+    # 2026-09-01追記: 従来はio.StringIOに全出力行を溜め、最後にgetvalue().encode()して
+    # io.BytesIO()へ再コピーしていたが、job_master.csvが5GB超級になった結果
+    # (テキストバッファ+エンコード後bytes+BytesIOコピーで実質3重に)出力バッファだけで
+    # 十数GBを消費し、日々増え続ける入力行(all_rows)・company_master索引(cm_index)と
+    # 合わせてOOM Killの主因になっていた(8/30・8/31にログがcompany_master索引の直後で
+    # 無言で途切れる形で発生・トレースバックなしはSIGKILLの典型症状)。
+    # ここをFargateのephemeral storage上の一時ファイルへの逐次書込に変更し、
+    # 出力サイズがメモリを圧迫しないようにする。
+    tmp_f = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".csv", encoding="utf-8-sig", newline="", delete=False
+    )
+    tmp_path = tmp_f.name
+    w = csv.DictWriter(tmp_f, fieldnames=l3.JOB_MASTER_SCHEMA, extrasaction="ignore")
     w.writeheader()
 
     match_stats = Counter()
@@ -313,20 +326,24 @@ def build(apply: bool):
     for src in sorted(by_source):
         parts = ", ".join(f"{k}={v:,}" for k, v in sorted(by_source[src].items()))
         print(f"  {src}: {parts}")
-    data = buf.getvalue().encode("utf-8-sig")
+    tmp_f.close()
 
     if not apply:
-        with open("job_master_dryrun.csv", "wb") as f:
-            f.write(data)
+        os.replace(tmp_path, "job_master_dryrun.csv")
         print("\n[dry-run] ローカル job_master_dryrun.csv に出力。S3へは書込まない。")
         return
 
     out_key = f"{JM_PREFIX}{today}/{JM_FILE}"
     # put_object はS3の単発PUT上限(5GB)を超えるとEntityTooLargeで失敗する。
-    # 件数増加でjob_master.csvが5GBを超えるようになったため、upload_fileobj
+    # 件数増加でjob_master.csvが5GBを超えるようになったため、upload_file
     # (boto3のTransferManagerが必要に応じ自動でマルチパートアップロードする)に変更。
-    _s3().upload_fileobj(io.BytesIO(data), BUCKET, out_key)
-    print(f"\n[apply] 書込完了: s3://{BUCKET}/{out_key}")
+    # ディスク上の一時ファイルから直接アップロードするため、出力全体をメモリに
+    # 保持しない(OOM対策、上のtmp_f経由の逐次書込とセット)。
+    try:
+        _s3().upload_file(tmp_path, BUCKET, out_key)
+        print(f"\n[apply] 書込完了: s3://{BUCKET}/{out_key}")
+    finally:
+        os.remove(tmp_path)
 
 
 def main():
