@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import re
 from datetime import datetime, timedelta, timezone
@@ -91,6 +92,15 @@ def _read_csv_s3(key: str) -> list[dict]:
     return list(csv.DictReader(io.StringIO(body)))
 
 
+def iter_lines_s3(key: str):
+    """S3オブジェクトを全量メモリに載せず1行ずつ(改行込み)返す。csv.reader/DictReaderにそのまま渡せる。"""
+    body = _s3().get_object(Bucket=BUCKET, Key=key)["Body"]
+    first = True
+    for raw in body.iter_lines(keepends=True):
+        yield raw.decode("utf-8-sig" if first else "utf-8", errors="replace")
+        first = False
+
+
 def read_all_l1(source: str) -> list[dict]:
     """そのソースの全L1パーティション(=追記ログ)を union して返す。"""
     s3 = _s3()
@@ -103,10 +113,83 @@ def read_all_l1(source: str) -> list[dict]:
     return rows
 
 
-def write_l1(source: str, rows: list[dict], run_date: str | None = None):
-    """生データを当日L1へ追記(既存全パーティションのjob_urlで重複除外)。"""
-    seen = {key_for(to_common(source, r)) for r in read_all_l1(source)}
-    new = [r for r in rows if key_for(to_common(source, r)) not in seen and key_for(r)]
+# 求人の中身が変わったかを見るための列(掲載期限・条件・本文)。scraped_at等の取得メタは含めない。
+FINGERPRINT_COLUMNS = [
+    "company_name",
+    "job_title",
+    "employment_type",
+    "salary_min",
+    "salary_max",
+    "location",
+    "work_hours",
+    "valid_through",
+    "description_snippet",
+]
+
+
+def content_fingerprint(row: dict) -> str:
+    common = to_common("", row)
+    h = hashlib.md5("\x1f".join(common[c] for c in FINGERPRINT_COLUMNS).encode())
+    return h.hexdigest()[:16]
+
+
+def known_fingerprints(source: str) -> dict[str, str]:
+    """最新L2の job_url→内容フィンガープリント。L1全履歴は読まない(refreshモードの比較元)。"""
+    key = latest_key(f"master/job_sources/{source}/", f"{source}.csv")
+    if not key:
+        return {}
+    return {
+        key_for(r): content_fingerprint(r)
+        for r in csv.DictReader(iter_lines_s3(key))
+        if r.get("job_url")
+    }
+
+
+def stale_urls(
+    source: str, older_than_days: int, limit: int | None = None
+) -> list[str]:
+    """最新L2で scraped_at が older_than_days 日より古いURL(古い順)。詳細の再取得予算を決めるコレクタ向け。"""
+    key = latest_key(f"master/job_sources/{source}/", f"{source}.csv")
+    if not key:
+        return []
+    cutoff = (datetime.now(JST) - timedelta(days=older_than_days)).strftime("%Y-%m-%d")
+    out = [
+        (r.get("scraped_at") or "", r["job_url"])
+        for r in csv.DictReader(iter_lines_s3(key))
+        if r.get("job_url") and (r.get("scraped_at") or "")[:10] < cutoff
+    ]
+    out.sort()
+    urls = [u for _, u in out]
+    return urls[:limit] if limit else urls
+
+
+def write_l1(
+    source: str,
+    rows: list[dict],
+    run_date: str | None = None,
+    refresh: bool = False,
+):
+    """生データを当日L1へ追記する。
+
+    既定は従来どおり、過去L1に無い job_url だけ追記。
+    refresh=True は、新規URLに加えて「最新L2と内容(FINGERPRINT_COLUMNS)が変わった既知URL」も
+    追記する。変更が無い既知URLは追記しない(last_seenはseen_urls→job_stateが持つ)。
+    refresh時は過去L1全履歴ではなく最新L2だけを読む。"""
+    if refresh:
+        known = known_fingerprints(source)
+        new = [
+            r
+            for r in rows
+            if key_for(r)
+            and known.get(key_for(to_common(source, r))) != content_fingerprint(r)
+        ]
+    else:
+        from job_sl.l2_stream import l1_job_url_keys
+
+        seen = l1_job_url_keys(source)
+        new = [
+            r for r in rows if key_for(to_common(source, r)) not in seen and key_for(r)
+        ]
     rd = run_date or _today()
     key = f"raw/job_sources/{source}/{rd}/{source}.csv"
     existing = []
@@ -143,13 +226,19 @@ class L1Checkpointer:
     `flush`のたびに行う(そこは中断時のデータ保全のため必要)。`build_l2`は
     呼ばないので、呼び出し元がrun完了時(および可能なら中断時)に1回だけ
     別途呼ぶこと。
+
+    refresh=True では履歴スキャンの代わりに最新L2の内容フィンガープリントだけを読み、
+    新規URLに加えて内容が変わった既知URLも追記する(write_l1(refresh=True)と同じ規則)。
     """
 
-    def __init__(self, source: str, run_date: str | None = None):
+    def __init__(self, source: str, run_date: str | None = None, refresh: bool = False):
         self.source = source
         self.run_date = run_date or _today()
         self._key = f"raw/job_sources/{source}/{self.run_date}/{source}.csv"
-        self._seen = {key_for(to_common(source, r)) for r in read_all_l1(source)}
+        self._fingerprints = known_fingerprints(source) if refresh else None
+        from job_sl.l2_stream import l1_job_url_keys
+
+        self._seen = set() if refresh else l1_job_url_keys(source)
         try:
             self._existing = _read_csv_s3(self._key)
         except Exception:
@@ -159,13 +248,22 @@ class L1Checkpointer:
     def flush(self, rows: list[dict]) -> int:
         """rowsのうち未知のjob_urlだけを当日L1パーティションへ追記して保存する。
         新規追記件数を返す。"""
-        new = [
-            r
-            for r in rows
-            if key_for(to_common(self.source, r)) not in self._seen and key_for(r)
-        ]
-        for r in new:
-            self._seen.add(key_for(to_common(self.source, r)))
+        if self._fingerprints is not None:
+            new = []
+            for r in rows:
+                k = key_for(to_common(self.source, r))
+                fp = content_fingerprint(r)
+                if k and self._fingerprints.get(k) != fp:
+                    self._fingerprints[k] = fp
+                    new.append(r)
+        else:
+            new = [
+                r
+                for r in rows
+                if key_for(to_common(self.source, r)) not in self._seen and key_for(r)
+            ]
+            for r in new:
+                self._seen.add(key_for(to_common(self.source, r)))
         self._new_rows.extend(new)
 
         all_rows = self._existing + self._new_rows
@@ -194,37 +292,13 @@ class L1Checkpointer:
 
 
 def build_l2(source: str, run_date: str | None = None, write: bool = True):
-    """L1全パーティションを union→正規化→job_urlでdedup(最新scraped_at採用)→L2へ。"""
-    commons = [to_common(source, r) for r in read_all_l1(source)]
-    commons = [c for c in commons if c["job_url"] and c["company_name"]]
+    """L1全パーティションを union→正規化→job_urlでdedup(最新scraped_at採用)→L2へ。
 
-    groups: dict = {}
-    for c in commons:
-        groups.setdefault(key_for(c), []).append(c)
+    実体は `l2_stream.build_l2_stream`(メモリ効率版)。write=True の戻り値の第1要素は
+    空リスト(呼び出し側はいずれも `_, l2 = build_l2(...)` で読み捨てている)。"""
+    from job_sl.l2_stream import build_l2_stream
 
-    out = []
-    for _, items in groups.items():
-        items.sort(key=lambda c: c["scraped_at"])  # 古→新
-        base = dict(items[-1])
-        for col in COMMON_SCHEMA:
-            if not base.get(col):
-                for c in reversed(items):
-                    if c.get(col):
-                        base[col] = c[col]
-                        break
-        out.append(base)
-
-    rd = run_date or _today()
-    key = f"master/job_sources/{source}/{rd}/{source}.csv"
-    if write:
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=COMMON_SCHEMA, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(out)
-        _s3().put_object(
-            Bucket=BUCKET, Key=key, Body=buf.getvalue().encode("utf-8-sig")
-        )
-    return out, key
+    return build_l2_stream(source, run_date=run_date, write=write)
 
 
 # ---- 最新パーティション解決 -------------------------------------------------
@@ -237,11 +311,14 @@ def existing_urls(source: str) -> set[str]:
     key = latest_key(f"master/job_sources/{source}/", f"{source}.csv")
     if not key:
         return set()
+    from job_sl.l2_stream import iter_csv_s3
+
     try:
-        rows = _read_csv_s3(key)
+        return {
+            r.get("job_url", "").strip() for r in iter_csv_s3(key) if r.get("job_url")
+        }
     except Exception:
         return set()
-    return {r.get("job_url", "").strip() for r in rows if r.get("job_url")}
 
 
 # ---- 掲載終了検知(seen_urls) -----------------------------------------------
