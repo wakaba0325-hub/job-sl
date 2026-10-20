@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import os
 import re
 import sys
@@ -104,14 +103,8 @@ def _load_company_master():
     key = latest_key(CM_PREFIX, CM_FILE)
     if not key:
         raise SystemExit("company_master が見つかりません")
-    body = (
-        _s3()
-        .get_object(Bucket=BUCKET, Key=key)["Body"]
-        .read()
-        .decode("utf-8-sig", errors="replace")
-    )
     print(f"  company_master: {key}")
-    return csv.DictReader(io.StringIO(body))
+    return csv.DictReader(iter_lines_s3(key))
 
 
 def _list_dates(prefix: str, fname: str) -> list[str]:

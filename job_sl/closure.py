@@ -50,6 +50,11 @@ MAX_ROW_DROP_RATIO = 0.2  # 状態の行数が前回比でこれ以上減った�
 SUSPECT_CAP_MIN = (
     100_000  # 確認件数がこの値以上かつ10000の倍数なら上限打ち切りの疑いとして警告
 )
+# sitemap のファイル上限(50,000件/ファイル)でcollectorの対象から外れている媒体(2026-10-20調査)。
+# mynavi: sitemap_jobs_08(994件)をcollectorが読まない。mynavi_kango: sitemap-detail_03(11,868件)を読まない。
+# 範囲外は新規掲載のみで、既存の収集済みURLが範囲外へ移る事例は確認できなかったため判定は止めず、
+# 確認件数が丸い数字になる警告(毎日exit 2になる)だけ出さない。collectorがsitemapを全件読むようになったら外す。
+KNOWN_SITEMAP_CAPPED = {"mynavi", "mynavi_kango"}
 
 STATE_COLUMNS = [
     "job_key",
@@ -187,7 +192,11 @@ def plan_source(
         return SourcePlan(source, "hold", "no_seen_file", detail="seenファイル無し")
     anomalies = []
     total = seen.total()
-    if total >= SUSPECT_CAP_MIN and total % 10000 == 0:
+    if (
+        total >= SUSPECT_CAP_MIN
+        and total % 10000 == 0
+        and source not in KNOWN_SITEMAP_CAPPED
+    ):
         anomalies.append(f"{source}: 確認件数{total:,}が丸い数字(上限打ち切りの疑い)")
 
     if not seen.missing:
