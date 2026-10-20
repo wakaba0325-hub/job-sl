@@ -12,7 +12,7 @@
 
 処理:
   1. 全ソースL2をunion
-  2. company_master突合で法人番号付与(l3.match_houjin)
+  2. company_master突合で法人番号付与(matching.match_houjin)
   3. job_urlで既存job_masterと突合し first_seen_date を継承、無ければ当日=新規(is_new_today=1)
   4. 掲載終了検知: l3.CLOSURE_DETECTION_SOURCES対象ソースは、当日のseen_urlsに無いjob_urlを
      listing_status="closed"とする(初検知日はclosed_detected_dateに記録し、以降は変えない)。
@@ -36,7 +36,7 @@ import tempfile
 from collections import Counter
 
 from . import BUCKET, _read_csv_s3, _s3, _today, latest_key
-from . import l3
+from . import l3, matching
 
 csv.field_size_limit(10**7)
 
@@ -209,7 +209,7 @@ def build(apply: bool):
 
     print(f"\n全ソース合計: {len(all_rows):,}行")
 
-    cm_index = l3.index_company_master(_load_company_master())
+    cm_index = matching.index_company_master(_load_company_master())
     print(f"company_master索引: {len(cm_index):,}社(正規化名ユニーク)")
 
     prev_meta, prev_source_counts = _load_existing_job_master()
@@ -270,9 +270,21 @@ def build(apply: bool):
     n_new = 0
     while all_rows:
         r = all_rows.pop()
-        houjin, ambiguous, method = l3.match_houjin(
-            r.get("company_name", ""), cm_index, location=r.get("location", "")
-        )
+        company_name = r.get("company_name", "")
+        is_anonymous = matching.is_anonymous_name(company_name)
+        if is_anonymous:
+            houjin, ambiguous, method, confidence = "", False, "anonymous", ""
+        else:
+            houjin, ambiguous, method, confidence = matching.match_houjin(
+                company_name,
+                cm_index,
+                location=r.get("location", ""),
+                text=" ".join(
+                    r.get(k, "")
+                    for k in ("description_snippet", "appeal_points", "job_title")
+                ),
+                job_url=r.get("job_url", ""),
+            )
         match_stats[
             "matched" if houjin else ("ambiguous" if ambiguous else "unmatched")
         ] += 1
@@ -305,6 +317,11 @@ def build(apply: bool):
         row["houjin_bangou"] = houjin
         row["is_ambiguous_company"] = "1" if ambiguous else ""
         row["match_method"] = method
+        row["match_confidence"] = confidence
+        row["is_staffing_agent"] = (
+            "1" if matching.is_staffing_agent_name(company_name) else ""
+        )
+        row["is_anonymous"] = "1" if is_anonymous else ""
         row["first_seen_date"] = first_seen
         row["is_new_today"] = is_new
         row["listing_status"] = listing_status
