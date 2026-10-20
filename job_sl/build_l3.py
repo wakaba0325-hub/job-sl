@@ -1,27 +1,24 @@
-"""build_l3: 全ソースのL2 + company_master + 既存job_masterを統合しjob_masterを再生成する。
+"""build_l3: 全ソースのL2 + company_master + 前回 job_state を統合し job_master と job_state を再生成する。
 
 入力:
   - L2 各ソース最新パーティション  master/job_sources/<source>/{最新}/<source>.csv
   - company_master 最新            master/company_master/{最新}/company_master.csv
-  - 既存 job_master 最新(あれば)    master/job_master/{最新}/job_master.csv
-      (job_urlごとの first_seen_date / listing_status / closed_detected_date を引き継ぐため)
-  - 当日の seen_urls  raw/job_sources/<source>/{当日}/<source>_seen_urls.csv
-      (l3.CLOSURE_DETECTION_SOURCES対象ソースのみ。各コレクタがサイト全体を毎日フル巡回する中で
-      既に計算済みの「本日確認できた全URL」をそのまま書き出したもの。jobmedley/mynaviは
-      シャード実行時 `<source>_seen_urls_shard{N}.csv` に分かれるため全シャード分をunionする)
+  - 前回 job_state                 master/job_state/{当日より前の最新}/job_state.csv
+      (job_urlごとの first/last_seen・listing_status・closed_detected_date。同日再実行でも当日分を
+      前回と取り違えない。job_master(十数GB)を前回状態として読まない)
+  - 当日の seen_urls  raw/job_sources/<source>/{当日}/<source>_seen_urls[_shard{N}].csv
+      (l3.CLOSURE_DETECTION_SOURCES対象。ファイルがある=その巡回が完走した。シャード媒体は
+      SHARDED_SOURCES の本数ぶん揃って初めて媒体全体の判定をする。詳細は closure.py)
 
 処理:
-  1. 全ソースL2をunion
-  2. company_master突合で法人番号付与(matching.match_houjin)
-  3. job_urlで既存job_masterと突合し first_seen_date を継承、無ければ当日=新規(is_new_today=1)
-  4. 掲載終了検知: l3.CLOSURE_DETECTION_SOURCES対象ソースは、当日のseen_urlsに無いjob_urlを
-     listing_status="closed"とする(初検知日はclosed_detected_dateに記録し、以降は変えない)。
-     安全装置: 当日確認できたURL件数が前日job_master内の同ソース件数の
-     l3.SAFETY_THRESHOLD_RATIO(既定70%)を下回った場合、クロール不完全の疑いとして
-     当日はそのソースの掲載終了判定を全件スキップし、listing_status="unknown"とする。
-     対象外ソースはlisting_statusを常に"unknown"とする。
-  5. master/job_master/{当日}/job_master.csv へ書込(スナップショット型・全件洗い替え)
+  1. 全ソースL2をjob_urlの小文字・trimキーで重複排除(シャード間重複。scraped_atが新しい行を採用)
+  2. closure.Judge で当日の状態(active/closed/unknown + status_reason)を決める
+  3. 保持窓: closedは検知日から365日、unknownは最後の確認/初出から365日を過ぎたら出力しない
+  4. company_master突合で法人番号付与(matching.match_houjin。match_confidence/is_staffing_agent/is_anonymousも付与)
+  5. master/job_master/{当日}/job_master.csv と master/job_state/{当日}/job_state.csv へ書込
 
+異常(L2ソース欠落・行数激減)なら何も書込まず exit 1。巡回が完走しなかった媒体が(想定外に)あれば
+書込のうえ exit 2。--prune apply を付けたときだけ古い世代を削除する(既定はdry-run表示のみ)。
 既定は dry-run。--apply で書込。
 """
 
@@ -32,11 +29,13 @@ import csv
 import io
 import os
 import re
+import sys
 import tempfile
 from collections import Counter
+from datetime import date
 
-from . import BUCKET, _read_csv_s3, _s3, _today, latest_key
-from . import l3, matching
+from . import BUCKET, _s3, _today, iter_lines_s3, latest_key
+from . import closure, l3, matching, retention
 
 csv.field_size_limit(10**7)
 
@@ -96,6 +95,9 @@ CM_PREFIX = "master/company_master/"
 CM_FILE = "company_master.csv"
 JM_PREFIX = "master/job_master/"
 JM_FILE = "job_master.csv"
+JS_PREFIX = "master/job_state/"
+JS_FILE = "job_state.csv"
+OUTPUT_SCHEMA = l3.JOB_MASTER_SCHEMA + closure.EXTRA_OUTPUT_COLUMNS
 
 
 def _load_company_master():
@@ -112,164 +114,149 @@ def _load_company_master():
     return csv.DictReader(io.StringIO(body))
 
 
-def _load_existing_job_master():
-    """既存job_masterから job_url→{first_seen_date, listing_status, closed_detected_date}
-    のメタ情報と、ソース別の行数(安全装置の前日ベースライン)を返す。
-
-    メモリ効率のため `_read_csv_s3`(list(DictReader(...))で全カラムを一括list化する)は
-    使わず、DictReaderを1行ずつ遅延評価する。既存job_masterは全30カラムだが実際に使うのは
-    job_url込み4カラムのみのため、全カラムのdictを数百万行分list保持すると
-    (all_rows/cm_indexが既にメモリを占有した状態で)ピーク時にOOMの原因になっていた。
-    1行ずつ処理し使う分だけprev_metaに残すことで、同等の結果をより少ないメモリで得る。"""
-    key = latest_key(JM_PREFIX, JM_FILE)
-    if not key:
-        print("  既存job_master: なし(初回ビルド)")
-        return {}, Counter()
-    body = (
-        _s3()
-        .get_object(Bucket=BUCKET, Key=key)["Body"]
-        .read()
-        .decode("utf-8-sig", errors="replace")
-    )
-    prev_meta = {}
-    prev_source_counts = Counter()
-    n = 0
-    for r in csv.DictReader(io.StringIO(body)):
-        n += 1
-        job_url = r.get("job_url")
-        if not job_url:
-            continue
-        prev_meta[job_url] = {
-            "first_seen_date": r.get("first_seen_date", ""),
-            "listing_status": r.get("listing_status", ""),
-            "closed_detected_date": r.get("closed_detected_date", ""),
-        }
-        prev_source_counts[r.get("source", "")] += 1
-    print(f"  既存job_master: {key}  ({n:,}行)")
-    return prev_meta, prev_source_counts
+def _list_dates(prefix: str, fname: str) -> list[str]:
+    """`{prefix}{YYYYMMDD}/{fname}` の日付一覧(昇順)。"""
+    pat = re.compile(rf"^{re.escape(prefix)}(\d{{8}})/{re.escape(fname)}$")
+    out = []
+    for page in (
+        _s3().get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix)
+    ):
+        for o in page.get("Contents", []):
+            m = pat.match(o["Key"])
+            if m:
+                out.append(m.group(1))
+    return sorted(out)
 
 
-def _load_seen_urls(source: str, today: str) -> tuple[set[str], list[str]]:
-    """当日の `{source}_seen_urls.csv`(シャード分割時は `{source}_seen_urls_shard{N}.csv` 全て)
-    を読み込みunionしたjob_url集合を返す。戻り値は (job_url集合, 読んだキー一覧)。
-    該当ファイルが1つも無ければ空集合(=安全装置が自動的に発火して当日の掲載終了判定が
-    スキップされる)。"""
+def _load_prev_state(today: str) -> tuple[dict, str | None]:
+    """当日より前の最新 job_state。無ければ空(初回=移行前)。"""
+    dates = [d for d in _list_dates(JS_PREFIX, JS_FILE) if d < today]
+    if not dates:
+        return {}, None
+    key = f"{JS_PREFIX}{dates[-1]}/{JS_FILE}"
+    state = closure.read_state(iter_lines_s3(key))
+    print(f"  前回job_state: {key}  ({len(state):,}件)")
+    return state, dates[-1]
+
+
+def load_seen(source: str, n_shards: int, today: str) -> closure.SourceSeen:
+    """当日の `{source}_seen_urls.csv`(シャード媒体は `_shard{N}`)を読む。"""
     prefix = f"raw/job_sources/{source}/{today}/"
     pat = re.compile(
-        rf"^{re.escape(prefix)}{re.escape(source)}_seen_urls(_shard\d+)?\.csv$"
+        rf"^{re.escape(prefix)}{re.escape(source)}_seen_urls(?:_shard(\d+))?\.csv$"
     )
-    s3 = _s3()
-    keys = []
-    pg = s3.get_paginator("list_objects_v2")
-    for page in pg.paginate(Bucket=BUCKET, Prefix=prefix):
+    seen = closure.SourceSeen(source, list(range(n_shards)))
+    for page in (
+        _s3().get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix)
+    ):
         for o in page.get("Contents", []):
-            if pat.match(o["Key"]):
-                keys.append(o["Key"])
-    urls: set[str] = set()
-    for k in keys:
-        try:
-            rows = _read_csv_s3(k)
-        except Exception:
-            continue
-        for r in rows:
-            u = (r.get("job_url") or "").strip()
-            if u:
-                urls.add(u)
-    return urls, keys
-
-
-def build(apply: bool):
-    today = _today()
-    today_iso = f"{today[:4]}-{today[4:6]}-{today[6:]}"
-
-    all_rows = []
-    for src in SOURCES:
-        key = latest_key(f"{L2_PREFIX}{src}/", f"{src}.csv")
-        if not key:
-            print(f"  L2 {src}: なし")
-            continue
-        rows = _read_csv_s3(key)
-        for r in rows:
-            r["source"] = src
-        all_rows.extend(rows)
-        print(f"  L2 {src}: {key}  {len(rows):,}行")
-
-    for display_src, shard_srcs in SHARDED_SOURCES.items():
-        n_total = 0
-        for shard_src in shard_srcs:
-            key = latest_key(f"{L2_PREFIX}{shard_src}/", f"{shard_src}.csv")
-            if not key:
+            m = pat.match(o["Key"])
+            if not m:
                 continue
-            rows = _read_csv_s3(key)
-            for r in rows:
-                r["source"] = display_src
-            all_rows.extend(rows)
-            n_total += len(rows)
-        print(f"  L2 {display_src}(shard統合): {n_total:,}行")
+            shard = int(m.group(1)) if m.group(1) is not None else 0
+            seen.shard_urls.setdefault(shard, set()).update(
+                closure.parse_seen_lines(iter_lines_s3(o["Key"]))
+            )
+    return seen
 
-    print(f"\n全ソース合計: {len(all_rows):,}行")
+
+def _l2_files() -> list[tuple[str, str, str]]:
+    """(表示source, L2のsource名, 最新キー)。無いものは除く。"""
+    files = []
+    pairs = [(s, s) for s in SOURCES]
+    pairs += [(disp, sh) for disp, shs in SHARDED_SOURCES.items() for sh in shs]
+    for disp, src in pairs:
+        key = latest_key(f"{L2_PREFIX}{src}/", f"{src}.csv")
+        if key:
+            files.append((disp, src, key))
+        else:
+            print(f"  L2 {src}: なし")
+    return files
+
+
+def _iter_l2(files):
+    for fi, (disp, _src, key) in enumerate(files):
+        for ri, r in enumerate(csv.DictReader(iter_lines_s3(key))):
+            yield fi, ri, disp, r
+
+
+def build(apply: bool, prune: str = "dry", today_s: str | None = None) -> int:
+    today = today_s or _today()
+    today_d = date(int(today[:4]), int(today[4:6]), int(today[6:]))
+
+    files = _l2_files()
+    for disp, src, key in files:
+        print(f"  L2 {src}: {key}")
 
     cm_index = matching.index_company_master(_load_company_master())
     print(f"company_master索引: {len(cm_index):,}社(正規化名ユニーク)")
 
-    prev_meta, prev_source_counts = _load_existing_job_master()
-
-    print(f"\n=== 掲載終了検知: 当日seen_urls読込・安全装置判定 ===")
-    seen_urls_by_source: dict[str, set[str]] = {}
-    safety_ok_by_source: dict[str, bool] = {}
-    for src in l3.CLOSURE_DETECTION_SOURCES:
-        urls, keys = _load_seen_urls(src, today)
-        seen_urls_by_source[src] = urls
-        prev_count = prev_source_counts.get(src, 0)
-        seen_count = len(urls)
-        if prev_count == 0:
-            ok, ratio_desc = True, "前日ベースライン無し(初回扱い)"
-        else:
-            ratio = seen_count / prev_count
-            ok = ratio >= l3.SAFETY_THRESHOLD_RATIO
-            ratio_desc = f"前日比{ratio:.1%}(閾値{l3.SAFETY_THRESHOLD_RATIO:.0%})"
-        safety_ok_by_source[src] = ok
+    prev, prev_date = _load_prev_state(today)
+    if not prev:
         print(
-            f"  {src}: seen_urlsファイル{len(keys)}件 / 本日確認{seen_count:,}件 / "
-            f"前日job_master{prev_count:,}件 / {ratio_desc} "
-            f"[{'OK' if ok else '安全装置発火'}]"
+            "  [WARN] 前回job_stateが無い(初回/移行前)。全求人が新規扱い・掲載終了は未確認のまま始まります"
         )
-        if not ok:
-            print(
-                f"    [WARNING] {src}: 本日確認できたURL件数が閾値未満に急減。"
-                f"クロール不完全の疑いがあるため、本日は{src}の掲載終了判定を全件スキップし"
-                f"listing_status=unknownとします。"
-            )
 
-    # メモリ効率のため、all_rows(全ソース分の入力行)とout(出力行)を同時に全件保持しない。
-    # all_rowsをreverse()して末尾からpop()することで、消費した入力行から順次解放しつつ
-    # (元の順序はreverse+pop-from-endで維持される)、出力もリストに溜めずCSVバッファへ
-    # 都度書き出す。件数が急増(マイナビ系8媒体・レバウェル系2媒体追加等)した際に
-    # all_rows+out二重保持がOOMの一因になっていたための対策。
-    n_total = len(all_rows)
-    all_rows.reverse()
+    print("\n=== 掲載終了検知: 当日seen_urls ===")
+    seen_by_source = {}
+    for src in l3.CLOSURE_DETECTION_SOURCES:
+        seen_by_source[src] = load_seen(
+            src, len(SHARDED_SOURCES.get(src, [None])), today
+        )
+    judge = closure.Judge(prev, seen_by_source, l3.CLOSURE_DETECTION_SOURCES, today_d)
+    warnings = []
+    for src, plan in judge.plans.items():
+        sn = seen_by_source[src]
+        print(
+            f"  {src}: シャード{len(sn.present)}/{len(sn.expected_shards)} / 確認{sn.total():,}件 / "
+            f"{plan.mode}{' ' + plan.reason if plan.reason else ''} {plan.detail}"
+        )
+        warnings += plan.anomalies
+        if plan.mode != "judge" and src not in closure.EXPECTED_NO_SEEN:
+            warnings.append(f"{src}: 判定保留({plan.reason}) {plan.detail}")
 
-    # 2026-09-01追記: 従来はio.StringIOに全出力行を溜め、最後にgetvalue().encode()して
-    # io.BytesIO()へ再コピーしていたが、job_master.csvが5GB超級になった結果
-    # (テキストバッファ+エンコード後bytes+BytesIOコピーで実質3重に)出力バッファだけで
-    # 十数GBを消費し、日々増え続ける入力行(all_rows)・company_master索引(cm_index)と
-    # 合わせてOOM Killの主因になっていた(8/30・8/31にログがcompany_master索引の直後で
-    # 無言で途切れる形で発生・トレースバックなしはSIGKILLの典型症状)。
-    # ここをFargateのephemeral storage上の一時ファイルへの逐次書込に変更し、
-    # 出力サイズがメモリを圧迫しないようにする。
+    # 1周目: キーごとに採用する行(scraped_at最新、同値なら先に読んだ方)を決める。
+    best: dict[str, tuple] = {}
+    vt_acc: Counter = Counter()
+    for fi, ri, disp, r in _iter_l2(files):
+        k = closure.norm_key(r.get("job_url", ""))
+        if not k:
+            continue
+        judge.vt_past_rate(disp, k, r.get("valid_through", ""), vt_acc)
+        cur = best.get(k)
+        sa = r.get("scraped_at", "")
+        if cur is None or sa > cur[0]:
+            best[k] = (sa, fi, ri)
+    print(f"\n全ソースL2: ユニークURL {len(best):,}件")
+    unreliable = judge.set_vt_reliability(vt_acc)
+    if unreliable:
+        print(f"  valid_through が過去ばかりで判定に使わない媒体: {sorted(unreliable)}")
+
     tmp_f = tempfile.NamedTemporaryFile(
         mode="w", suffix=".csv", encoding="utf-8-sig", newline="", delete=False
     )
     tmp_path = tmp_f.name
-    w = csv.DictWriter(tmp_f, fieldnames=l3.JOB_MASTER_SCHEMA, extrasaction="ignore")
+    w = csv.DictWriter(tmp_f, fieldnames=OUTPUT_SCHEMA, extrasaction="ignore")
     w.writeheader()
 
+    # 2周目: 採用行だけを判定→保持窓→突合→書出。
+    new_state: dict[str, closure.St] = {}
     match_stats = Counter()
     method_stats = Counter()
-    listing_status_stats: Counter = Counter()
-    n_new = 0
-    while all_rows:
-        r = all_rows.pop()
+    status_stats: Counter = Counter()
+    out_by_source: Counter = Counter()
+    n_new = n_dropped = 0
+    for fi, ri, disp, r in _iter_l2(files):
+        k = closure.norm_key(r.get("job_url", ""))
+        b = best.get(k)
+        if b is None or b[1] != fi or b[2] != ri:
+            continue
+        del best[k]
+        st = judge.decide_row(k, disp, r.get("valid_through", ""))
+        if not closure.within_retention(st, today_d):
+            n_dropped += 1
+            continue
+        new_state[k] = st
         company_name = r.get("company_name", "")
         is_anonymous = matching.is_anonymous_name(company_name)
         if is_anonymous:
@@ -280,8 +267,8 @@ def build(apply: bool):
                 cm_index,
                 location=r.get("location", ""),
                 text=" ".join(
-                    r.get(k, "")
-                    for k in ("description_snippet", "appeal_points", "job_title")
+                    r.get(c, "")
+                    for c in ("description_snippet", "appeal_points", "job_title")
                 ),
                 job_url=r.get("job_url", ""),
             )
@@ -289,31 +276,13 @@ def build(apply: bool):
             "matched" if houjin else ("ambiguous" if ambiguous else "unmatched")
         ] += 1
         method_stats[method] += 1
-        job_url = r.get("job_url", "")
-        prev = prev_meta.get(job_url, {})
-        first_seen = prev.get("first_seen_date") or today_iso
-        is_new = "1" if job_url not in prev_meta else "0"
-        if is_new == "1":
-            n_new += 1
+        is_new = k not in prev
+        n_new += is_new
+        status_stats[(disp, st.status, st.reason)] += 1
+        out_by_source[disp] += 1
 
-        src = r.get("source", "")
-        if src in l3.CLOSURE_DETECTION_SOURCES and safety_ok_by_source.get(src):
-            if job_url in seen_urls_by_source.get(src, set()):
-                listing_status = "active"
-                closed_detected_date = ""
-            else:
-                listing_status = "closed"
-                closed_detected_date = prev.get("closed_detected_date") or today_iso
-        elif src in l3.CLOSURE_DETECTION_SOURCES:
-            # 安全装置発火中: 判定は行わず、closed_detected_dateのみ過去の検知記録を維持する
-            listing_status = "unknown"
-            closed_detected_date = prev.get("closed_detected_date", "")
-        else:
-            listing_status = "unknown"
-            closed_detected_date = ""
-        listing_status_stats[(src, listing_status)] += 1
-
-        row = {k: r.get(k, "") for k in l3.JOB_MASTER_SCHEMA}
+        row = {c: r.get(c, "") for c in l3.JOB_MASTER_SCHEMA}
+        row["source"] = disp
         row["houjin_bangou"] = houjin
         row["is_ambiguous_company"] = "1" if ambiguous else ""
         row["match_method"] = method
@@ -322,52 +291,96 @@ def build(apply: bool):
             "1" if matching.is_staffing_agent_name(company_name) else ""
         )
         row["is_anonymous"] = "1" if is_anonymous else ""
-        row["first_seen_date"] = first_seen
-        row["is_new_today"] = is_new
-        row["listing_status"] = listing_status
-        row["closed_detected_date"] = closed_detected_date
+        row["first_seen_date"] = st.first_seen
+        row["is_new_today"] = "1" if is_new else "0"
+        row["listing_status"] = st.status
+        row["closed_detected_date"] = st.closed_date
+        row["last_seen_date"] = st.last_seen
+        row["status_reason"] = st.reason
         w.writerow(row)
+    tmp_f.close()
 
-    print(f"\n=== company_master突合 ===")
+    print("\n=== company_master突合 ===")
     print(
         f"  マッチ: {match_stats['matched']:,} / 同名複数: {match_stats['ambiguous']:,} / 未マッチ: {match_stats['unmatched']:,}"
     )
     print(f"  内訳: {dict(method_stats)}")
-    print(f"\n=== 新規掲載検知 ===")
-    print(f"  本日新規(is_new_today=1): {n_new:,} / 既存: {n_total - n_new:,}")
+    print(
+        f"\n=== 新規掲載検知 ===\n  本日新規: {n_new:,} / 既存: {len(new_state) - n_new:,}"
+    )
+    print(
+        f"\n=== 状態(source別 listing_status/status_reason) 保持窓で除外 {n_dropped:,}件 ==="
+    )
+    for (src, status, reason), n in sorted(status_stats.items()):
+        print(f"  {src}: {status}/{reason} = {n:,}")
 
-    print(f"\n=== 掲載終了検知 結果(source別 listing_status) ===")
-    by_source: dict[str, dict[str, int]] = {}
-    for (src, status), n in listing_status_stats.items():
-        by_source.setdefault(src, {})[status] = n
-    for src in sorted(by_source):
-        parts = ", ".join(f"{k}={v:,}" for k, v in sorted(by_source[src].items()))
-        print(f"  {src}: {parts}")
-    tmp_f.close()
+    errors = []
+    if not prev and apply:
+        errors.append(
+            "前回job_stateが無いため書込しません(先に job_sl.migrate_state を実行)"
+        )
+    if prev:
+        if len(new_state) < len(prev) * (1 - closure.MAX_ROW_DROP_RATIO):
+            errors.append(
+                f"状態の行数が前回比{len(new_state) / len(prev):.0%}に激減({len(prev):,}→{len(new_state):,})"
+            )
+        prev_by_src = Counter(s.source for s in prev.values())
+        for src, n in prev_by_src.items():
+            if n >= 1000 and out_by_source.get(src, 0) < n * 0.5:
+                errors.append(
+                    f"{src}: 出力{out_by_source.get(src, 0):,}件 / 前回{n:,}件。L2が欠落/縮小している疑い"
+                )
+    for e in errors:
+        print(f"[ERROR] {e}")
+    for wmsg in warnings:
+        print(f"[WARN] {wmsg}")
+    if errors:
+        os.remove(tmp_path)
+        print("異常のため書込しません")
+        return 1
 
     if not apply:
         os.replace(tmp_path, "job_master_dryrun.csv")
         print("\n[dry-run] ローカル job_master_dryrun.csv に出力。S3へは書込まない。")
-        return
+    else:
+        # 5GB超のためマルチパート(upload_file)。ディスク上の一時ファイルから直接アップロードする。
+        state_path = tmp_path + ".state"
+        with open(state_path, "w", encoding="utf-8-sig", newline="") as sf:
+            closure.write_state(sf, new_state)
+        try:
+            _s3().upload_file(state_path, BUCKET, f"{JS_PREFIX}{today}/{JS_FILE}")
+            _s3().upload_file(tmp_path, BUCKET, f"{JM_PREFIX}{today}/{JM_FILE}")
+            print(
+                f"\n[apply] 書込完了: s3://{BUCKET}/{JM_PREFIX}{today}/{JM_FILE} (+ {JS_PREFIX}{today}/{JS_FILE})"
+            )
+        finally:
+            os.remove(tmp_path)
+            os.remove(state_path)
+        _prune(prune == "apply", [src for _d, src, _k in files])
+    return 2 if warnings else 0
 
-    out_key = f"{JM_PREFIX}{today}/{JM_FILE}"
-    # put_object はS3の単発PUT上限(5GB)を超えるとEntityTooLargeで失敗する。
-    # 件数増加でjob_master.csvが5GBを超えるようになったため、upload_file
-    # (boto3のTransferManagerが必要に応じ自動でマルチパートアップロードする)に変更。
-    # ディスク上の一時ファイルから直接アップロードするため、出力全体をメモリに
-    # 保持しない(OOM対策、上のtmp_f経由の逐次書込とセット)。
-    try:
-        _s3().upload_file(tmp_path, BUCKET, out_key)
-        print(f"\n[apply] 書込完了: s3://{BUCKET}/{out_key}")
-    finally:
-        os.remove(tmp_path)
+
+def _prune(do_delete: bool, l2_sources: list[str]) -> None:
+    dry = not do_delete
+    retention.prune_generations(
+        JM_PREFIX, JM_FILE, retention.KEEP_JOB_MASTER, dry_run=dry
+    )
+    retention.prune_generations(
+        JS_PREFIX, JS_FILE, retention.KEEP_JOB_STATE, dry_run=dry
+    )
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="S3へ書込(既定はdry-run)")
+    ap.add_argument(
+        "--prune",
+        choices=["dry", "apply"],
+        default="dry",
+        help="書込後の世代削除。apply のときだけ削除(既定は削除予定の表示のみ)",
+    )
     a = ap.parse_args()
-    build(a.apply)
+    sys.exit(build(a.apply, a.prune))
 
 
 if __name__ == "__main__":
