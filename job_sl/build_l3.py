@@ -11,7 +11,8 @@
       SHARDED_SOURCES の本数ぶん揃って初めて媒体全体の判定をする。詳細は closure.py)
 
 処理:
-  1. 全ソースL2をjob_urlの小文字・trimキーで重複排除(シャード間重複。scraped_atが新しい行を採用)
+  1. 全ソースL2をjob_urlの小文字・trimキーで重複排除(シャード間重複。scraped_atが新しい行、同値なら情報が多い行を採用)。
+     URL不正・社名空・未来日付のscraped_atの行は除外(rowcheck)。取得日から2年超先のvalid_throughは仮値として空にする
   2. closure.Judge で当日の状態(active/closed/unknown + status_reason)を決める
   3. 保持窓: closedは検知日から365日、unknownは最後の確認/初出から365日を過ぎたら出力しない
   4. company_master突合で法人番号付与(matching.match_houjin。match_confidence/is_staffing_agent/is_anonymousも付与)
@@ -34,7 +35,7 @@ from collections import Counter
 from datetime import date
 
 from . import BUCKET, _s3, _today, iter_lines_s3, latest_key
-from . import closure, l3, matching, retention
+from . import closure, l3, matching, retention, rowcheck
 
 csv.field_size_limit(10**7)
 
@@ -211,16 +212,22 @@ def build(apply: bool, prune: str = "dry", today_s: str | None = None) -> int:
     # 1周目: キーごとに採用する行(scraped_at最新、同値なら先に読んだ方)を決める。
     best: dict[str, tuple] = {}
     vt_acc: Counter = Counter()
+    skipped: Counter = Counter()
     for fi, ri, disp, r in _iter_l2(files):
-        k = closure.norm_key(r.get("job_url", ""))
-        if not k:
+        issue = rowcheck.row_issue(r, today_d)
+        if issue:
+            skipped[issue] += 1
             continue
+        k = closure.norm_key(r.get("job_url", ""))
         judge.vt_past_rate(disp, k, r.get("valid_through", ""), vt_acc)
         cur = best.get(k)
         sa = r.get("scraped_at", "")
-        if cur is None or sa > cur[0]:
-            best[k] = (sa, fi, ri)
+        nf = rowcheck.filled_count(r)
+        if cur is None or (sa, nf) > (cur[0], cur[3]):
+            best[k] = (sa, fi, ri, nf)
     print(f"\n全ソースL2: ユニークURL {len(best):,}件")
+    if skipped:
+        print(f"  異常行を除外: {dict(skipped)}")
     unreliable = judge.set_vt_reliability(vt_acc)
     if unreliable:
         print(f"  valid_through が過去ばかりで判定に使わない媒体: {sorted(unreliable)}")
@@ -276,6 +283,9 @@ def build(apply: bool, prune: str = "dry", today_s: str | None = None) -> int:
 
         row = {c: r.get(c, "") for c in l3.JOB_MASTER_SCHEMA}
         row["source"] = disp
+        row["valid_through"] = rowcheck.normalize_valid_through(
+            r.get("valid_through", ""), r.get("scraped_at", "")
+        )
         row["houjin_bangou"] = houjin
         row["is_ambiguous_company"] = "1" if ambiguous else ""
         row["match_method"] = method
