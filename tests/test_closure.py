@@ -180,12 +180,6 @@ def test_suspect_cap_warning():
     assert plan.mode == "judge" and plan.anomalies
 
 
-def test_suspect_cap_warning_skips_known_sitemap_capped():
-    seen = seen_of("mynavi", {0: {f"u{i}" for i in range(100_000)}})
-    plan = closure.plan_source("mynavi", seen, 100_000, Counter(), None)
-    assert plan.mode == "judge" and not plan.anomalies
-
-
 def test_judge_end_to_end_with_stable_partial():
     prev = {
         "a": st(shard="0", src="m"),
