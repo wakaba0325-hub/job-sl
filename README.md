@@ -66,6 +66,22 @@ L1を書き換えない)。再取得するURLの選定には `stale_urls(source,
 - `build_l3 --prune apply` で job_master 7世代 / job_state 14世代 / L2 14世代を超えた古い世代を削除(既定は削除予定の表示のみ。
   根拠は `job_sl/retention.py`)
 
+## 過去分のクリーンアップ(backfill・一回限り)
+
+`python -m job_sl.backfill <audit|rebuild-l2|replay-state|prune>`(すべて既定 dry-run。L1の原本には書かない・消さない)。
+
+- `rebuild-l2 --sources a,b [--apply]`: L1の最新日がL2より新しい(build_l2がOOM等で凍結した)ソースを、L1全履歴からstreamingで作り直して
+  当日フォルダへ新規書込(既存キーは上書きしない、1回3ソースまで)。引数なしで凍結ソース一覧
+- `replay-state --end YYYYMMDD [--apply]`: 過去の seen_urls を日付順に `closure.Judge` へ通し、`master/job_state/{end}/` を復元
+  (`migrate_state` の代わり。first_seen は L2 の scraped_at の最小、終了検知日は最後に確認できた日の翌日、
+  一度も確認できないまま閉じた行は `backfill_never_seen`)。必ず `rebuild-l2` の後に実行
+- `prune [--mode delete|backup] [--max-objects N] [--protect YYYYMMDD,..] [--apply]`: job_master 7 / job_state 14 / L2 14 世代を超えた古い世代を
+  delete marker(または `_backup/` へ退避)。versioning が Enabled でなければ中止。未来日付・空の最新世代のグループは触らない
+- `audit`: 最新L2の異常行(URL不正・社名空・未来日付)・グループ内重複・未来日付フォルダ・凍結L2の全量スキャン(読取のみ)
+
+build_l3 は異常行(`rowcheck.row_issue`)を除外し、同一URLの重複は scraped_at が新しい行(同値なら情報が多い行)を採用、
+取得日から2年超先の `valid_through`(mynavi_pharma の掲載日+20年など媒体の仮値)は空にして出力する。
+
 ## L3: job_master (全ソース統合・company_master突合・新規掲載検知)
 
 `python -m job_sl.build_l3 [--apply]` (実行は別リポ `job-master-consolidate` から)で:
