@@ -1,0 +1,9 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Action": ["ecs:RunTask", "ecs:TagResource", "ecs:ListTagsForResource"], "Resource": "*"},
+    {"Effect": "Allow", "Action": "iam:PassRole", "Resource": "arn:aws:iam::539691208375:role/*", "Condition": {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}},
+    {"Effect": "Allow", "Action": "sns:Publish", "Resource": "arn:aws:sns:ap-northeast-1:539691208375:job-pipeline-alerts"},
+    {"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"], "Resource": "*"}
+  ]
+}

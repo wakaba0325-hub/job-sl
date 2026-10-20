@@ -1,0 +1,15 @@
+{
+  "family": "job-freshness",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",
+  "memory": "2048",
+  "executionRoleArn": "<job-master-consolidate と同じ execution role>",
+  "taskRoleArn": "<job-master-consolidate と同じ task role>",
+  "containerDefinitions": [{
+    "name": "freshness",
+    "image": "<job-master-consolidate の ECR イメージ(job-sl 反映版)>",
+    "command": ["python", "-m", "job_sl.freshness", "--max-age-days", "2", "--put-metrics", "--sns-topic", "arn:aws:sns:ap-northeast-1:539691208375:job-pipeline-alerts"],
+    "logConfiguration": {"logDriver": "awslogs", "options": {"awslogs-group": "/ecs/job-freshness", "awslogs-region": "ap-northeast-1", "awslogs-stream-prefix": "ecs"}}
+  }]
+}

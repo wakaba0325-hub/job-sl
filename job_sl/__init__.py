@@ -184,7 +184,9 @@ def write_l1(
             and known.get(key_for(to_common(source, r))) != content_fingerprint(r)
         ]
     else:
-        seen = {key_for(to_common(source, r)) for r in read_all_l1(source)}
+        from job_sl.l2_stream import l1_job_url_keys
+
+        seen = l1_job_url_keys(source)
         new = [
             r for r in rows if key_for(to_common(source, r)) not in seen and key_for(r)
         ]
@@ -234,11 +236,9 @@ class L1Checkpointer:
         self.run_date = run_date or _today()
         self._key = f"raw/job_sources/{source}/{self.run_date}/{source}.csv"
         self._fingerprints = known_fingerprints(source) if refresh else None
-        self._seen = (
-            set()
-            if refresh
-            else {key_for(to_common(source, r)) for r in read_all_l1(source)}
-        )
+        from job_sl.l2_stream import l1_job_url_keys
+
+        self._seen = set() if refresh else l1_job_url_keys(source)
         try:
             self._existing = _read_csv_s3(self._key)
         except Exception:
@@ -292,37 +292,13 @@ class L1Checkpointer:
 
 
 def build_l2(source: str, run_date: str | None = None, write: bool = True):
-    """L1全パーティションを union→正規化→job_urlでdedup(最新scraped_at採用)→L2へ。"""
-    commons = [to_common(source, r) for r in read_all_l1(source)]
-    commons = [c for c in commons if c["job_url"] and c["company_name"]]
+    """L1全パーティションを union→正規化→job_urlでdedup(最新scraped_at採用)→L2へ。
 
-    groups: dict = {}
-    for c in commons:
-        groups.setdefault(key_for(c), []).append(c)
+    実体は `l2_stream.build_l2_stream`(メモリ効率版)。write=True の戻り値の第1要素は
+    空リスト(呼び出し側はいずれも `_, l2 = build_l2(...)` で読み捨てている)。"""
+    from job_sl.l2_stream import build_l2_stream
 
-    out = []
-    for _, items in groups.items():
-        items.sort(key=lambda c: c["scraped_at"])  # 古→新
-        base = dict(items[-1])
-        for col in COMMON_SCHEMA:
-            if not base.get(col):
-                for c in reversed(items):
-                    if c.get(col):
-                        base[col] = c[col]
-                        break
-        out.append(base)
-
-    rd = run_date or _today()
-    key = f"master/job_sources/{source}/{rd}/{source}.csv"
-    if write:
-        buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=COMMON_SCHEMA, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(out)
-        _s3().put_object(
-            Bucket=BUCKET, Key=key, Body=buf.getvalue().encode("utf-8-sig")
-        )
-    return out, key
+    return build_l2_stream(source, run_date=run_date, write=write)
 
 
 # ---- 最新パーティション解決 -------------------------------------------------
@@ -335,11 +311,14 @@ def existing_urls(source: str) -> set[str]:
     key = latest_key(f"master/job_sources/{source}/", f"{source}.csv")
     if not key:
         return set()
+    from job_sl.l2_stream import iter_csv_s3
+
     try:
-        rows = _read_csv_s3(key)
+        return {
+            r.get("job_url", "").strip() for r in iter_csv_s3(key) if r.get("job_url")
+        }
     except Exception:
         return set()
-    return {r.get("job_url", "").strip() for r in rows if r.get("job_url")}
 
 
 # ---- 掲載終了検知(seen_urls) -----------------------------------------------
